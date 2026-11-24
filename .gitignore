@@ -5,3 +5,4 @@ node_modules/
 skills-lock.json
 /oxlint.config.ts
 /tools/oxlint/anti-slop/
+anti-slop/
