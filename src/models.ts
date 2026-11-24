@@ -36,9 +36,16 @@ export interface OpenRouterModel {
 				verbosity?: string;
 			}
 		>;
+		/**
+		 * Gateway reasoning switches: `toggle` means on/off, `effort` lists the values the provider accepts.
+		 * Stays correct when variants lag behind or are missing.
+		 */
+		reasoning_options?: KiloReasoningOption[];
 		ai_sdk_provider?: string;
 	};
 }
+
+type KiloReasoningOption = { type: "toggle" } | { type: "effort"; values?: string[] | null };
 
 export function parsePrice(price: string | null | undefined): number {
 	if (!price) return 0;
@@ -52,9 +59,8 @@ export function isFreeModel(m: OpenRouterModel): boolean {
 	const prompt = parseFloat(m.pricing?.prompt ?? "1");
 	const completion = parseFloat(m.pricing?.completion ?? "1");
 	if (prompt !== 0 || completion !== 0) return false;
-	// Zero pricing alone isn't reliable (some models report "0" but require auth).
-	// Use the :free suffix (OpenRouter convention), Kilo-native models (no vendor
-	// prefix), or known Kilo/OpenRouter free routers.
+	// Zero pricing alone isn't reliable: some models report "0" but still require auth.
+	// Trust the :free suffix, Kilo-native ids without a vendor prefix, and the known free routers.
 	if (m.id === "kilo-auto/free") return true;
 	if (m.id.includes(":free")) return true;
 	if (!m.id.includes("/")) return true;
@@ -62,7 +68,23 @@ export function isFreeModel(m: OpenRouterModel): boolean {
 	return false;
 }
 
-type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+/** Pi's reasoning levels below off, weakest first. The scale Kilo efforts are ranked on, never a source of levels. */
+const PI_REASONING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+type PiReasoningLevel = (typeof PI_REASONING_LEVELS)[number];
+
+const PI_LEVEL_INTENSITY = new Map<string, number>(PI_REASONING_LEVELS.map((level, index) => [level, index]));
+
+/**
+ * Pi level shown for a single Kilo thinking mode whose effort name Pi does not know.
+ * Intensity cannot be derived from one unnamed state, so it lands mid-scale.
+ */
+const UNNAMED_EFFORT_LEVEL: PiReasoningLevel = "medium";
+
+/** Provider effort that turns reasoning off. OpenRouter's convention is "none". */
+const DEFAULT_OFF_EFFORT = "none";
+
+type KiloThinkingLevelMap = NonNullable<KiloChatModelConfig["thinkingLevelMap"]>;
 
 type KiloModelCompat = {
 	thinkingFormat?: "openrouter";
@@ -75,9 +97,8 @@ function shouldUseResponsesApi(m: OpenRouterModel): boolean {
 	const aiSdkProvider = m.opencode?.ai_sdk_provider;
 	if (aiSdkProvider === "openai") return true;
 
-	// Some model metadata may arrive before ai_sdk_provider is populated. KiloCode
-	// routes current OpenAI reasoning/frontier models through the Responses API;
-	// using chat completions for these yields: "please use any of: responses".
+	// Metadata can arrive before ai_sdk_provider is populated, so gpt-5 and o-series are matched by id.
+	// Chat completions for those answer "please use any of: responses".
 	const id = m.id.toLowerCase();
 	const shortId = id.includes("/") ? (id.split("/").pop() ?? id) : id;
 	return (
@@ -118,56 +139,143 @@ function getKiloModelCompat(m: OpenRouterModel, api: Api | undefined): KiloChatM
 	return compat;
 }
 
-function mapVariantEffort(
-	variants: NonNullable<OpenRouterModel["opencode"]>["variants"],
-	key: string,
-): string | undefined {
-	const variant = variants?.[key];
-	if (!variant) return undefined;
-	const reasoning = variant.reasoning;
-	if (!reasoning) return key;
-	if (reasoning.enabled === false || reasoning.effort === "none") return "none";
-	return reasoning.effort ?? key;
+function normalizeEffort(value: string | null | undefined): string | undefined {
+	const normalized = value?.trim().toLowerCase();
+	return normalized ? normalized : undefined;
 }
 
-function thinkingLevelMapFromVariants(
-	variants: NonNullable<OpenRouterModel["opencode"]>["variants"],
-): KiloChatModelConfig["thinkingLevelMap"] | undefined {
-	if (!variants || Object.keys(variants).length === 0) return undefined;
+interface KiloReasoningDeclaration {
+	/** Provider efforts that enable reasoning, weakest first. */
+	efforts: string[];
+	/** Provider effort that disables reasoning, when Kilo declares one. */
+	offEffort?: string;
+}
 
-	const map: Partial<Record<PiThinkingLevel, string | null>> = {};
-	const off = mapVariantEffort(variants, "none") ?? mapVariantEffort(variants, "instant");
-	if (off !== undefined) map.off = off;
+/**
+ * Reads the reasoning states Kilo declares, through the effort each variant carries rather than its name.
+ * `reasoning_options` covers models whose variants lag behind; an effort of "none" is the off switch.
+ */
+function readKiloReasoning(m: OpenRouterModel): KiloReasoningDeclaration | undefined {
+	const variants = m.opencode?.variants;
+	const options = m.opencode?.reasoning_options;
+	if (!variants && !options) return undefined;
 
-	for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"] as const) {
-		const effort = mapVariantEffort(variants, level);
-		map[level] = effort === undefined ? null : effort;
+	const declared: string[] = [];
+	const declare = (effort: string) => {
+		if (!declared.includes(effort)) declared.push(effort);
+	};
+	let offEffort: string | undefined;
+
+	for (const option of options ?? []) {
+		if (option?.type === "toggle") {
+			offEffort ??= DEFAULT_OFF_EFFORT;
+			continue;
+		}
+		if (option?.type !== "effort" || !Array.isArray(option.values)) continue;
+		for (const value of option.values) {
+			const effort = normalizeEffort(value);
+			if (!effort) continue;
+			if (effort === "none") offEffort ??= effort;
+			else declare(effort);
+		}
+	}
+
+	for (const [key, variant] of Object.entries(variants ?? {})) {
+		const reasoning = variant?.reasoning;
+		if (!reasoning) {
+			// A preset that only changes verbosity or sampling declares no effort Pi can send.
+			const keyEffort = normalizeEffort(key);
+			if (keyEffort === "none") offEffort ??= keyEffort;
+			continue;
+		}
+		const effort = normalizeEffort(reasoning.effort);
+		if (reasoning.enabled === false || effort === "none") {
+			offEffort ??= effort ?? DEFAULT_OFF_EFFORT;
+			continue;
+		}
+		if (effort) declare(effort);
+	}
+
+	if (declared.length === 0 && offEffort === undefined) return undefined;
+
+	return { efforts: orderByIntensity(declared), offEffort };
+}
+
+function intensityOf(effort: string): number | undefined {
+	return PI_LEVEL_INTENSITY.get(effort);
+}
+
+/**
+ * Orders Kilo's efforts weakest first, ranking known names by Pi's scale so a strongest-first declaration is corrected.
+ * Unknown names keep Kilo's declaration order: Pi does not guess a strength it was not told.
+ */
+function orderByIntensity(declared: readonly string[]): string[] {
+	const ordered = [...declared];
+	const known = ordered.filter((effort) => intensityOf(effort) !== undefined);
+	if (known.length === ordered.length) {
+		return ordered.sort((a, b) => (intensityOf(a) as number) - (intensityOf(b) as number));
+	}
+	// Unknown vocabulary: Kilo's order is the intensity order.
+	// Flipped only when its known efforts are listed strongest first.
+	const ranks = known.map((effort) => intensityOf(effort) as number);
+	const descending = ranks.some((rank, index) => index > 0 && rank > (ranks[index - 1] as number));
+	const ascending = ranks.some((rank, index) => index > 0 && rank < (ranks[index - 1] as number));
+	return descending && !ascending ? ordered.reverse() : ordered;
+}
+
+/**
+ * Pairs Kilo's efforts with Pi levels when the names do not line up: count from Kilo, order preserved, extremes at the ends.
+ * More states than Pi has levels is the one case the count cannot hold, so the range is kept and the middle thinned.
+ */
+function pairUnnamedEfforts(count: number): { level: PiReasoningLevel; effortIndex: number }[] {
+	const last = PI_REASONING_LEVELS.length - 1;
+	if (count === 1) return [{ level: UNNAMED_EFFORT_LEVEL, effortIndex: 0 }];
+	if (count <= PI_REASONING_LEVELS.length) {
+		// Floors, so a state never lands on a stronger Pi level than its proportional position.
+		return Array.from({ length: count }, (_, index) => ({
+			level: PI_REASONING_LEVELS[Math.floor((index * last) / (count - 1))] as PiReasoningLevel,
+			effortIndex: index,
+		}));
+	}
+	return Array.from({ length: PI_REASONING_LEVELS.length }, (_, index) => ({
+		level: PI_REASONING_LEVELS[index] as PiReasoningLevel,
+		effortIndex: Math.round((index * (count - 1)) / last),
+	}));
+}
+
+/**
+ * Maps a catalog entry onto Pi levels: one level per effort Kilo declares, plus off when Kilo can disable reasoning.
+ * Undeclared levels stay null so Pi hides them instead of clamping to a state the model was never offered.
+ */
+export function buildThinkingLevelMap(m: OpenRouterModel): KiloThinkingLevelMap {
+	const map: KiloThinkingLevelMap = {
+		off: null,
+		minimal: null,
+		low: null,
+		medium: null,
+		high: null,
+		xhigh: null,
+		max: null,
+	};
+
+	const declaration = readKiloReasoning(m);
+	if (!declaration) return map;
+	if (declaration.offEffort !== undefined) map.off = declaration.offEffort;
+
+	const { efforts } = declaration;
+	if (efforts.length === 0) return map;
+
+	if (efforts.every((effort) => intensityOf(effort) !== undefined)) {
+		// Kilo named its states in Pi's vocabulary: each keeps its own level.
+		for (const effort of efforts) map[effort as PiReasoningLevel] = effort;
+		return map;
+	}
+
+	for (const { level, effortIndex } of pairUnnamedEfforts(efforts.length)) {
+		map[level] = efforts[effortIndex] as string;
 	}
 
 	return map;
-}
-
-function getKiloThinkingLevelMap(m: OpenRouterModel): KiloChatModelConfig["thinkingLevelMap"] | undefined {
-	const fromVariants = thinkingLevelMapFromVariants(m.opencode?.variants);
-	if (/^deepseek\/deepseek-v4-(flash|pro)(?:-|$)/.test(m.id)) {
-		return { ...fromVariants, max: "max" };
-	}
-	if (fromVariants) return fromVariants;
-
-	// Safety net for the current frontier OpenAI model while Kilo/OpenRouter
-	// model metadata is catching up.
-	if (m.id.includes("gpt-5.5")) {
-		return {
-			off: "none",
-			minimal: null,
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-		};
-	}
-
-	return undefined;
 }
 
 export function selectKiloCatalogModels(
@@ -238,7 +346,7 @@ export function mapOpenRouterModel(m: OpenRouterModel): KiloChatModelConfig {
 		},
 		contextWindow: m.context_length,
 		maxTokens: maxTokens,
-		thinkingLevelMap: getKiloThinkingLevelMap(m),
+		thinkingLevelMap: buildThinkingLevelMap(m),
 		compat: getKiloModelCompat(m, api),
 	};
 }

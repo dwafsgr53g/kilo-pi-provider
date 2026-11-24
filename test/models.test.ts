@@ -1,6 +1,8 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, getSupportedThinkingLevels, type ThinkingLevel } from "@earendil-works/pi-ai";
 import { describe, expect, test } from "vitest";
 import {
+	buildThinkingLevelMap,
 	mapOpenRouterModel,
 	mergeKiloCatalogModels,
 	type OpenRouterModel,
@@ -190,20 +192,199 @@ describe("mapOpenRouterModel", () => {
 		});
 	});
 
-	test.each([
-		"deepseek/deepseek-v4-flash",
-		"deepseek/deepseek-v4-flash-0731",
-		"deepseek/deepseek-v4-pro",
-		"deepseek/deepseek-v4-pro-0813",
-	])("exposes max thinking for %s when the gateway omits it", (id) => {
-		expect(mapOpenRouterModel({ ...modelWithGatewayVariants, id }).thinkingLevelMap).toEqual({
+	test.each(["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"])(
+		"keeps %s at the efforts the catalog declares",
+		(id) => {
+			expect(mapOpenRouterModel({ ...modelWithGatewayVariants, id }).thinkingLevelMap).toEqual({
+				off: "none",
+				minimal: null,
+				low: null,
+				medium: null,
+				high: "high",
+				xhigh: "xhigh",
+				max: null,
+			});
+		},
+	);
+
+	test("keeps gpt-5.5 at the efforts the catalog declares", () => {
+		expect(mapOpenRouterModel({ ...modelWithGatewayVariants, id: "openai/gpt-5.5" }).thinkingLevelMap).toEqual({
 			off: "none",
 			minimal: null,
 			low: null,
 			medium: null,
 			high: "high",
 			xhigh: "xhigh",
-			max: "max",
+			max: null,
 		});
+	});
+});
+
+describe("buildThinkingLevelMap", () => {
+	type KiloVariants = NonNullable<NonNullable<OpenRouterModel["opencode"]>["variants"]>;
+
+	const effort = (value: string, enabled = true) => ({ reasoning: { enabled, effort: value } });
+
+	const catalogEntry = (opencode: OpenRouterModel["opencode"]): OpenRouterModel => ({
+		id: "acme/model",
+		name: "Acme Model",
+		context_length: 128_000,
+		supported_parameters: ["reasoning"],
+		opencode,
+	});
+
+	const expected = (values: Partial<Record<string, string | null>>) => ({
+		off: null,
+		minimal: null,
+		low: null,
+		medium: null,
+		high: null,
+		xhigh: null,
+		max: null,
+		...values,
+	});
+
+	const piModel = (model: OpenRouterModel): Model<"openai-completions"> => ({
+		id: model.id,
+		name: model.name,
+		provider: "kilo",
+		api: "openai-completions",
+		baseUrl: "https://api.kilo.ai/api/openrouter",
+		reasoning: model.supported_parameters?.includes("reasoning") ?? false,
+		thinkingLevelMap: buildThinkingLevelMap(model),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: model.context_length,
+		maxTokens: 1_024,
+	});
+
+	// What Pi itself offers and clamps to, i.e. what the user actually sees.
+	const levelsOf = (model: OpenRouterModel) => getSupportedThinkingLevels(piModel(model));
+	const clampTo = (model: OpenRouterModel, level: ThinkingLevel) => clampThinkingLevel(piModel(model), level);
+
+	test("offers exactly the states a toggle pair declares", () => {
+		const model = catalogEntry({
+			variants: { instant: effort("none", false), thinking: effort("high") },
+			reasoning_options: [{ type: "toggle" }],
+		});
+
+		expect(levelsOf(model)).toEqual(["off", "high"]);
+		expect(buildThinkingLevelMap(model)).toEqual(expected({ off: "none", high: "high" }));
+	});
+
+	test("offers every level the gateway declares", () => {
+		const model = catalogEntry({
+			variants: {
+				none: effort("none", false),
+				minimal: effort("minimal"),
+				low: effort("low"),
+				medium: effort("medium"),
+				high: effort("high"),
+				xhigh: effort("xhigh"),
+				max: effort("max"),
+			},
+		});
+
+		expect(levelsOf(model)).toEqual(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+	});
+
+	// Kilo owns the count: Pi offers one choice per declared state, no more, no fewer.
+	test.each([
+		[1, ["solo"], ["medium"]],
+		[2, ["light", "heavy"], ["minimal", "max"]],
+		[3, ["light", "medium", "heavy"], ["minimal", "medium", "max"]],
+		[4, ["a", "b", "c", "d"], ["minimal", "low", "high", "max"]],
+		[5, ["a", "b", "c", "d", "e"], ["minimal", "low", "medium", "high", "max"]],
+		[6, ["a", "b", "c", "d", "e", "f"], ["minimal", "low", "medium", "high", "xhigh", "max"]],
+	])("maps %i unnamed states onto Pi levels", (_count, efforts, levels) => {
+		const variants = Object.fromEntries(
+			(efforts as string[]).map((effortName, index) => [`preset-${index}`, effort(effortName)]),
+		) as KiloVariants;
+		const model = catalogEntry({ variants });
+
+		expect(levelsOf(model)).toEqual(levels);
+	});
+
+	test("keeps the Pi count equal to the Kilo count for named states", () => {
+		const model = catalogEntry({
+			variants: {
+				none: effort("none", false),
+				low: effort("low"),
+				high: effort("high"),
+				max: effort("max"),
+			},
+		});
+
+		expect(levelsOf(model)).toEqual(["off", "low", "high", "max"]);
+	});
+
+	test("maps unnamed states by order and intensity, passing the Kilo effort through", () => {
+		const model = catalogEntry({
+			variants: { first: effort("light"), second: effort("heavy"), third: effort("severe") },
+		});
+
+		expect(buildThinkingLevelMap(model)).toEqual(
+			expected({ minimal: "light", medium: "heavy", max: "severe" }),
+		);
+	});
+
+	test("keeps Kilo's direction when it declares its strongest state first", () => {
+		const model = catalogEntry({
+			variants: { top: effort("max"), middle: effort("medium"), bottom: effort("low") },
+			reasoning_options: [{ type: "effort", values: ["max", "medium", "low"] }],
+		});
+
+		expect(levelsOf(model)).toEqual(["low", "medium", "max"]);
+		expect(clampTo(model, "max")).toBe("max");
+	});
+
+	test("clamps to the strongest state Kilo declared, never to an undeclared one", () => {
+		const model = catalogEntry({
+			variants: { low: effort("low"), high: effort("high") },
+			reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+		});
+
+		expect(levelsOf(model)).toEqual(["low", "high"]);
+		expect(clampTo(model, "max")).toBe("high");
+		expect(clampTo(model, "minimal")).toBe("low");
+	});
+
+	test("falls back to reasoning_options when variants omit a level", () => {
+		const model = catalogEntry({
+			variants: { high: effort("high") },
+			reasoning_options: [{ type: "effort", values: ["none", "low", "high", "max"] }],
+		});
+
+		expect(levelsOf(model)).toEqual(["off", "low", "high", "max"]);
+	});
+
+	test("hides off for models that cannot disable reasoning", () => {
+		const model = catalogEntry({
+			variants: { low: effort("low"), medium: effort("medium"), high: effort("high") },
+			reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+		});
+
+		expect(levelsOf(model)).toEqual(["low", "medium", "high"]);
+	});
+
+	test("ignores the variant name when it disagrees with the effort", () => {
+		const model = catalogEntry({
+			variants: { thinking: effort("minimal"), turbo: effort("max") },
+		});
+
+		expect(levelsOf(model)).toEqual(["minimal", "max"]);
+	});
+
+	test("declares nothing when Kilo describes no reasoning state", () => {
+		expect(buildThinkingLevelMap(catalogEntry({}))).toEqual(expected({}));
+		expect(buildThinkingLevelMap(catalogEntry({ variants: {} }))).toEqual(expected({}));
+		expect(levelsOf(catalogEntry({}))).toEqual([]);
+		expect(levelsOf(catalogEntry({ variants: { instant: { reasoning: { enabled: true } } } }))).toEqual([]);
+	});
+
+	test("offers only off when Kilo declares no thinking state", () => {
+		const model = catalogEntry({ variants: { instant: effort("none", false) } });
+
+		expect(levelsOf(model)).toEqual(["off"]);
 	});
 });
